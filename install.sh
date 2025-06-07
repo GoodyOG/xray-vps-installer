@@ -3,7 +3,7 @@
 # ==============================================================================
 # All-in-One Xray Server Management Script
 # Author: GoodyOG (with assistance from Gemini)
-# Version: 6.0
+# Version: 7.0 - "It Just Works" Edition
 # ==============================================================================
 
 # --- Globals and Colors ---
@@ -28,14 +28,26 @@ isRoot() {
     fi
 }
 
-installPackage() {
-    local pkg_name="$1"
-    if ! command -v "$pkg_name" &>/dev/null; then
-        echo "Info: Installing $pkg_name..."
-        if ! (apt-get -y --no-install-recommends install "$pkg_name" || yum -y install "$pkg_name" || dnf -y install "$pkg_name") &>/dev/null; then
-            echo "${red}Error: Installation of $pkg_name failed.${reset}"
-            return 1
-        fi
+# This function now directly attempts installation, which is more robust for a setup script.
+installDependencies() {
+    echo "Info: Installing required packages..."
+    # Detect package manager
+    if command -v apt-get &>/dev/null; then
+        apt-get update -y
+        apt-get -y --no-install-recommends install curl jq qrencode nginx certbot python3-certbot-nginx
+    elif command -v yum &>/dev/null; then
+        yum -y install epel-release
+        yum -y install curl jq qrencode nginx certbot python3-certbot-nginx
+    elif command -v dnf &>/dev/null; then
+        dnf -y install epel-release
+        dnf -y install curl jq qrencode nginx certbot python3-certbot-nginx
+    else
+        echo "${red}Error: Unsupported package manager. Please install dependencies manually.${reset}"
+        return 1
+    fi
+    if ! command -v certbot &>/dev/null; then
+        echo "${red}Fatal: Certbot could not be installed. Cannot proceed.${reset}"
+        exit 1
     fi
 }
 
@@ -47,11 +59,17 @@ restartServices() {
 }
 
 # ==============================================================================
-# SECTION 2: CORE INSTALLATION
+# SECTION 2: CORE INSTALLATION LOGIC
 # ==============================================================================
 
-# ... [Cloudflare API, Certbot, Nginx/Xray Config functions from v5 remain here] ...
-# NOTE: Using the robust API-based cert installation from the last version
+set_proxy_status() {
+    local proxied="$1"
+    local zone_id="$2"
+    local dns_record_id="$3"
+    local cfApiToken="$4"
+    echo "Info: Setting Cloudflare proxy status to $proxied (orange cloud = true)..."
+    curl -s -X PATCH "https://api.cloudflare.com/client/v4/zones/$zone_id/dns_records/$dns_record_id" -H "Authorization: Bearer $cfApiToken" -H "Content-Type: application/json" --data "{\"proxied\":$proxied}" > /dev/null
+}
 
 getCertWithAutomatedToggling() {
     local userDomain="$1"
@@ -59,41 +77,33 @@ getCertWithAutomatedToggling() {
     local cfApiToken="$3"
     local zone_id dns_record_id
 
-    trap 'echo "Restoring CF proxy..."; set_proxy_status true "$zone_id" "$dns_record_id" "$cfApiToken"' EXIT
+    # Trap ensures we re-enable proxy even if script fails
+    trap 'echo "Ensuring Cloudflare proxy is restored..."; set_proxy_status true "$zone_id" "$dns_record_id" "$cfApiToken"' EXIT
 
     echo "Info: Finding Cloudflare Zone ID for $userDomain..."
     local domain_suffix=$(echo "$userDomain" | awk -F. '{print $(NF-1)"."$NF}')
     zone_info=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones?name=$domain_suffix" -H "Authorization: Bearer $cfApiToken" -H "Content-Type: application/json")
     zone_id=$(echo "$zone_info" | jq -r '.result[0].id')
-    if [[ "$zone_id" == "null" || -z "$zone_id" ]]; then echo "${red}Error: Could not find Zone ID.${reset}"; exit 1; fi
+    if [[ "$zone_id" == "null" || -z "$zone_id" ]]; then echo "${red}Error: Could not find Zone ID. Check domain/API token.${reset}"; exit 1; fi
 
     echo "Info: Finding DNS Record ID for $userDomain..."
     dns_records=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$zone_id/dns_records?type=A&name=$userDomain" -H "Authorization: Bearer $cfApiToken" -H "Content-Type: application/json")
     dns_record_id=$(echo "$dns_records" | jq -r '.result[0].id')
-    if [[ "$dns_record_id" == "null" || -z "$dns_record_id" ]]; then echo "${red}Error: Could not find A record.${reset}"; exit 1; fi
-
+    if [[ "$dns_record_id" == "null" || -z "$dns_record_id" ]]; then echo "${red}Error: Could not find an A record for $userDomain.${reset}"; exit 1; fi
+    
     set_proxy_status false "$zone_id" "$dns_record_id" "$cfApiToken"
-    echo "Info: Waiting 20 seconds for DNS to propagate..."
+    echo "Info: Waiting 20 seconds for DNS changes to propagate..."
     sleep 20
     
     echo "Info: Requesting Let's Encrypt certificate..."
     systemctl stop nginx &>/dev/null
     if ! certbot certonly --standalone -d "$userDomain" --agree-tos -n -m "$userEmail" --preferred-challenges http; then
-        echo "${red}Error: Certbot failed.${reset}"; exit 1;
+        echo "${red}Error: Certbot failed to get a certificate.${reset}"; exit 1;
     fi
     
+    echo "${green}Success! Certificate obtained.${reset}"
     set_proxy_status true "$zone_id" "$dns_record_id" "$cfApiToken"
-    trap - EXIT
-    echo "${green}Success! Certificate obtained and proxy re-enabled.${reset}"
-}
-
-set_proxy_status() {
-    local proxied="$1"
-    local zone_id="$2"
-    local dns_record_id="$3"
-    local cfApiToken="$4"
-    echo "Info: Setting Cloudflare proxy to $proxied..."
-    curl -s -X PATCH "https://api.cloudflare.com/client/v4/zones/$zone_id/dns_records/$dns_record_id" -H "Authorization: Bearer $cfApiToken" -H "Content-Type: application/json" --data "{\"proxied\":$proxied}" > /dev/null
+    trap - EXIT # Disable the trap, we're done.
 }
 
 writeNginxConfig() {
@@ -141,45 +151,19 @@ writeXrayConfigInitial() {
   "log": {"loglevel": "warning"},
   "inbounds": [
     {
-      "listen": "127.0.0.1",
-      "port": $xrayPort,
-      "protocol": "vless",
+      "listen": "127.0.0.1", "port": $xrayPort, "protocol": "vless",
       "settings": {
-        "clients": [
-          {
-            "id": "$uuid",
-            "email": "$clientName"
-          }
-        ],
+        "clients": [{"id": "$uuid", "email": "$clientName"}],
         "decryption": "none"
       },
-      "streamSettings": {
-        "network": "ws",
-        "wsSettings": {
-          "path": "$wsPath"
-        }
-      }
+      "streamSettings": {"network": "ws", "wsSettings": {"path": "$wsPath"}}
     }
   ],
   "outbounds": [
     {"protocol": "freedom", "tag": "direct"},
-    {
-      "protocol": "socks",
-      "tag": "warp-socks",
-      "settings": {
-        "servers": [{"address": "127.0.0.1", "port": 40000}]
-      }
-    }
+    {"protocol": "socks", "tag": "warp-socks", "settings": {"servers": [{"address": "127.0.0.1", "port": 40000}]}}
   ],
-  "routing": {
-    "rules": [
-      {
-        "type": "field",
-        "outboundTag": "warp-socks",
-        "domain": []
-      }
-    ]
-  }
+  "routing": {"rules": [{"type": "field", "outboundTag": "warp-socks", "domain": []}]}
 }
 EOF
 }
@@ -189,23 +173,17 @@ EOF
 # ==============================================================================
 
 installBBR() {
-    echo "Info: Installing BBR..."
-    if grep -q "BBR" /etc/sysctl.conf; then
-        echo "${yellow}BBR seems to be already enabled.${reset}"
-        return
-    fi
+    echo "Info: Enabling BBR..."
+    if grep -q "bbr" /etc/sysctl.conf; then echo "${yellow}BBR seems already enabled.${reset}"; return; fi
     echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
     echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
     sysctl -p
-    echo "${green}BBR enabled. A reboot is recommended to ensure it's fully active.${reset}"
+    echo "${green}BBR enabled. A reboot is recommended.${reset}"
 }
 
 installWarp() {
     echo "Info: Installing Cloudflare WARP..."
-    if command -v warp-cli &> /dev/null; then
-        echo "${yellow}WARP is already installed.${reset}"; return;
-    fi
-    (apt update || yum update || dnf update) &>/dev/null
+    if command -v warp-cli &> /dev/null; then echo "${yellow}WARP is already installed.${reset}"; return; fi
     curl -fsSL https://pkg.cloudflareclient.com/install.sh | bash
     warp-cli --accept-tos registration new
     warp-cli set-mode proxy
@@ -224,20 +202,16 @@ addVlessUser() {
 
 deleteVlessUser() {
     client_list=$(jq -r '.inbounds[0].settings.clients[] | "\(.email)"' "$XRAY_CONFIG_PATH")
-    if [[ $(echo "$client_list" | wc -l) -le 1 ]]; then
-        echo "${red}Cannot delete the last user.${reset}"; return;
-    fi
+    if [[ $(echo "$client_list" | wc -l) -le 1 ]]; then echo "${red}Cannot delete the last user.${reset}"; return; fi
     
     echo "Select user to delete:"
     select clientName in $client_list; do
         if [[ -n "$clientName" ]]; then
             jq "del(.inbounds[0].settings.clients[] | select(.email == \"$clientName\"))" "$XRAY_CONFIG_PATH" > "$XRAY_CONFIG_PATH.tmp" && mv "$XRAY_CONFIG_PATH.tmp" "$XRAY_CONFIG_PATH"
             restartServices
-            echo "${green}User '$clientName' deleted.${reset}"
-            break
+            echo "${green}User '$clientName' deleted.${reset}"; break
         else
-            echo "${red}Invalid selection.${reset}"
-        fi
+            echo "${red}Invalid selection.${reset}"; fi
     done
 }
 
@@ -270,14 +244,12 @@ addDomainToWarp() {
 removeDomainFromWarp() {
     domain_list=$(jq -r '.routing.rules[0].domain[]' "$XRAY_CONFIG_PATH")
     if [[ -z "$domain_list" ]]; then echo "${red}WARP domain list is empty.${reset}"; return; fi
-    
     echo "Select domain to remove from WARP routing:"
     select domain in $domain_list; do
         if [[ -n "$domain" ]]; then
             jq "del(.routing.rules[0].domain[] | select(. == \"$domain\"))" "$XRAY_CONFIG_PATH" > "$XRAY_CONFIG_PATH.tmp" && mv "$XRAY_CONFIG_PATH.tmp" "$XRAY_CONFIG_PATH"
             restartServices
-            echo "${green}Domain '$domain' removed from WARP routing.${reset}"
-            break
+            echo "${green}Domain '$domain' removed from WARP routing.${reset}"; break;
         fi
     done
 }
@@ -287,7 +259,6 @@ viewLogs() {
     case "$choice" in
         1) journalctl -u xray -f --no-pager ;;
         2) tail -f /var/log/nginx/access.log ;;
-        *) echo "Invalid choice." ;;
     esac
 }
 
@@ -307,14 +278,10 @@ show_xray_menu() {
     echo "0. Back to Main Menu"
     read -rp "Select an option: " choice
     case "$choice" in
-        1) addVlessUser ;;
-        2) deleteVlessUser ;;
-        3) listVlessUsers ;;
-        4) addDomainToWarp ;;
-        5) removeDomainFromWarp ;;
+        1) addVlessUser ;; 2) deleteVlessUser ;; 3) listVlessUsers ;;
+        4) addDomainToWarp ;; 5) removeDomainFromWarp ;;
         6) echo "Domains routed via WARP:"; jq -r '.routing.rules[0].domain[]' "$XRAY_CONFIG_PATH" ;;
-        0) return ;;
-        *) echo "${red}Invalid option.${reset}" ;;
+        0) return ;; *) echo "${red}Invalid option.${reset}" ;;
     esac
     read -n 1 -s -r -p "Press any key to continue..."
 }
@@ -331,14 +298,10 @@ show_server_menu() {
     echo "0. Back to Main Menu"
     read -rp "Select an option: " choice
     case "$choice" in
-        1) installBBR ;;
-        2) installWarp ;;
-        3) systemctl status xray nginx ;;
-        4) restartServices ;;
-        5) viewLogs ;;
+        1) installBBR ;; 2) installWarp ;; 3) systemctl status xray nginx ;;
+        4) restartServices ;; 5) viewLogs ;;
         6) bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install ;;
-        0) return ;;
-        *) echo "${red}Invalid option.${reset}" ;;
+        0) return ;; *) echo "${red}Invalid option.${reset}" ;;
     esac
     read -n 1 -s -r -p "Press any key to continue..."
 }
@@ -346,8 +309,8 @@ show_server_menu() {
 main_menu() {
     while true; do
         clear
-        echo -e "${yellow}Xray All-in-One Management Panel (v6.0)${reset}"
-        echo -e "Domain: ${green}$(grep -m 1 "server_name" "$NGINX_CONFIG_PATH" | awk '{print $2}' | sed 's/;//')${reset}"
+        echo -e "${yellow}Xray All-in-One Management Panel (v7.0)${reset}"
+        echo -e "Domain: ${green}$(grep -m 1 "server_name" "$NGINX_CONFIG_PATH" 2>/dev/null | awk '{print $2}' | sed 's/;//')${reset}"
         echo "----------------------------------------"
         echo "1. Manage Xray Users & Routing"
         echo "2. Manage Server & Services"
@@ -356,10 +319,8 @@ main_menu() {
         echo "----------------------------------------"
         read -rp "Select an option: " choice
         case "$choice" in
-            1) show_xray_menu ;;
-            2) show_server_menu ;;
-            9) uninstall_all ;;
-            0) break ;;
+            1) show_xray_menu ;; 2) show_server_menu ;;
+            9) uninstall_all ;; 0) break ;;
             *) echo "${red}Invalid option.${reset}"; sleep 1 ;;
         esac
     done
@@ -372,8 +333,8 @@ main_menu() {
 uninstall_all() {
     read -rp "${red}This will permanently delete everything. Are you sure? (y/n): ${reset}" confirm
     if [[ "$confirm" == "y" ]]; then
-        systemctl stop xray nginx
-        systemctl disable xray nginx
+        systemctl stop xray nginx &>/dev/null
+        systemctl disable xray nginx &>/dev/null
         bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ remove --purge
         (apt-get -y purge nginx* certbot* || yum -y remove nginx* certbot* || dnf -y remove nginx* certbot*)
         rm -rf /usr/local/etc/xray /etc/nginx /etc/letsencrypt /var/log/nginx
@@ -386,51 +347,42 @@ first_time_install() {
     isRoot
     echo -e "${yellow}Welcome to the Xray All-in-One installer!${reset}"
     
-    # Install base packages
-    (apt-get update || yum update || dnf update) &>/dev/null
-    installPackage "curl"
-    installPackage "jq"
-    installPackage "qrencode"
+    installDependencies
     
-    # Get user info
     read -rp "Enter your domain name: " userDomain
     read -rp "Enter your email (for Let's Encrypt): " userEmail
     read -rp "Enter your Cloudflare API Token (with DNS Edit permissions): " cfApiToken
 
-    # Get Cert
     getCertWithAutomatedToggling "$userDomain" "$userEmail" "$cfApiToken"
     
-    # Install Xray
+    echo "Info: Installing Xray-core..."
     bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install --without-logfiles
     
-    # Configure
     local initial_client="default-user"
     local initial_uuid=$(cat /proc/sys/kernel/random/uuid)
     local wsPath="/$(openssl rand -hex 8)"
     writeXrayConfigInitial "$initial_client" "$initial_uuid" "$wsPath"
     writeNginxConfig "$userDomain" "$wsPath"
     
-    # Optional components
     read -rp "Do you want to install WARP now? (y/n): " warp_choice
     if [[ "$warp_choice" == "y" ]]; then installWarp; fi
     read -rp "Do you want to enable BBR now? (y/n): " bbr_choice
     if [[ "$bbr_choice" == "y" ]]; then installBBR; fi
     
-    # Start services
     restartServices
     
-    # Save script
     cat "$0" > "$SCRIPT_PATH"
     chmod +x "$SCRIPT_PATH"
     
     echo -e "\n${green}=======================================================${reset}"
-    echo -e "      ✅ Installation Complete! ✅"
+    echo "      ✅ Installation Complete! ✅"
     echo -e "You can now run ${yellow}xray-menu${reset} anytime to manage your server."
     echo -e "${green}=======================================================${reset}\n"
     generateShareLink "$initial_uuid" "$initial_client"
 }
 
 # --- Entry Point ---
+# If the config file exists, show menu. Otherwise, run first-time install.
 if [[ -f "$XRAY_CONFIG_PATH" ]]; then
     main_menu
 else
